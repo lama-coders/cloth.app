@@ -424,7 +424,7 @@ def call_gemini_overlay(
 
     # Real call path using Gemini Generative Language API over HTTP
     try:
-        model_name = st.session_state.get("model_name", "gemini-2.5-flash-image")
+        model_name = get_model_name()
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         headers = {"Content-Type": "application/json"}
         params = {"key": api_key}
@@ -449,8 +449,6 @@ def call_gemini_overlay(
                     ],
                 }
             ],
-            # Ask for image/png output; supported on image-capable models
-            "generationConfig": {"response_mime_type": "image/png"},
         }
 
         resp = requests.post(url, headers=headers, params=params, json=payload, timeout=60)
@@ -476,36 +474,8 @@ def call_gemini_overlay(
                 return base64.b64decode(p["data"])  # best effort
         raise RuntimeError("Gemini response did not include image data.")
     except Exception as ex:
-        # Fallback to mock on any error so the app stays usable
-        st.error(f"Gemini call failed; falling back to mock. Details: {ex}")
-        photo_img = bytes_to_image_safe(photo_bytes)
-        clothing_img = bytes_to_image_safe(clothing_bytes)
-        opts = st.session_state.get("overlay_options", {}) if hasattr(st, "session_state") else {}
-        result = mock_overlay(
-            photo_img,
-            clothing_img,
-            remove_bg=bool(opts.get("remove_bg", True)),
-            width_pct=int(opts.get("width_pct", 60)),
-            y_pct=int(opts.get("y_pct", 32)),
-            rotation_deg=float(opts.get("rotation_deg", -3.0)),
-            perspective=float(opts.get("perspective", 0.08)),
-        )
-        return image_to_bytes_png(result)
-
-    # For now, fall back to mock if we ever reach here.
-    photo_img = bytes_to_image_safe(photo_bytes)
-    clothing_img = bytes_to_image_safe(clothing_bytes)
-    opts = st.session_state.get("overlay_options", {}) if hasattr(st, "session_state") else {}
-    result = mock_overlay(
-        photo_img,
-        clothing_img,
-        remove_bg=bool(opts.get("remove_bg", True)),
-        width_pct=int(opts.get("width_pct", 60)),
-        y_pct=int(opts.get("y_pct", 32)),
-        rotation_deg=float(opts.get("rotation_deg", -3.0)),
-        perspective=float(opts.get("perspective", 0.08)),
-    )
-    return image_to_bytes_png(result)
+        # Bubble the error up so UI can display a clear message
+        raise
 
 # =============================================================================
 # Prompt Template
@@ -554,6 +524,17 @@ def show_header_and_privacy():
     st.caption(PRIVACY_NOTE)
 
 
+def get_model_name() -> str:
+    """Return model name from secrets/env or a sensible default."""
+    try:
+        m = st.secrets.get("GEMINI_MODEL")  # type: ignore[attr-defined]
+        if m:
+            return str(m)
+    except Exception:
+        pass
+    return os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-image")
+
+
 def sidebar_controls() -> Tuple[bool, bool, str]:
     """Render toggles and prompt editor.
 
@@ -565,17 +546,9 @@ def sidebar_controls() -> Tuple[bool, bool, str]:
     st.sidebar.markdown("### Settings")
 
     api_key_present = bool(read_env_api_key())
-    use_real = st.sidebar.toggle(
-        "Use real Gemini",
-        value=api_key_present,
-        help="Enable to call Gemini if API key is set in env or Streamlit Secrets.",
-        disabled=not api_key_present,
-    )
-    mock_mode = st.sidebar.checkbox(
-        "Mock mode",
-        value=not use_real,
-        help="Use local Pillow overlay. Works without an API key.",
-    )
+    # Simplified: no toggles; we always attempt real Gemini if key present.
+    use_real = api_key_present
+    mock_mode = False
 
     with st.sidebar.expander("Prompt template — editable", expanded=False):
         prompt = st.text_area(
@@ -590,36 +563,6 @@ def sidebar_controls() -> Tuple[bool, bool, str]:
         )
 
     st.sidebar.caption(f"API key source: {api_key_source()}")
-
-    # Model selector (used when real Gemini is enabled)
-    model = st.sidebar.selectbox(
-        "Gemini model",
-        options=[
-            "gemini-2.5-flash-image",
-            "gemini-2.0-flash-exp",
-            "gemini-1.5-flash",
-        ],
-        index=0,
-        help="Model used for real calls. Must support image IO.",
-    )
-
-    with st.sidebar.expander("Try-on controls (mock)", expanded=False):
-        remove_bg = st.checkbox("Auto remove garment background", value=True,
-                                help="Tries to remove a near-uniform background from the clothing image. Works best if background is solid.")
-        width_pct = st.slider("Garment width (% of photo width)", min_value=30, max_value=95, value=60, step=1)
-        y_pct = st.slider("Vertical position (upper torso %)", min_value=20, max_value=55, value=32, step=1)
-        rotation_deg = st.slider("Rotation (degrees)", min_value=-15.0, max_value=15.0, value=-3.0, step=0.5)
-        perspective = st.slider("Perspective strength", min_value=0.0, max_value=0.3, value=0.08, step=0.01)
-
-        st.session_state["overlay_options"] = {
-            "remove_bg": remove_bg,
-            "width_pct": width_pct,
-            "y_pct": y_pct,
-            "rotation_deg": rotation_deg,
-            "perspective": perspective,
-        }
-
-    st.session_state["model_name"] = model
 
     with st.sidebar.expander("README / How to run", expanded=False):
         st.markdown(
@@ -666,7 +609,7 @@ def view_upload_and_apply(use_real: bool, mock_mode: bool, prompt_text: str):
     left, right = st.columns([1, 1.2])
 
     with left:
-        st.subheader("Option A — Upload & Apply")
+        st.subheader("Upload & Apply")
         user_photo_file = st.file_uploader("Upload your photo", type=["png", "jpg", "jpeg"]) 
         clothing_file = st.file_uploader("Upload clothing image (prefer PNG with transparency)", type=["png", "jpg", "jpeg"]) 
         apply_clicked = st.button("Apply", type="primary")
@@ -685,20 +628,23 @@ def view_upload_and_apply(use_real: bool, mock_mode: bool, prompt_text: str):
                         photo_bytes = image_to_bytes_png(photo_img)
                         clothing_bytes = image_to_bytes_png(clothing_img)
 
-                        api_key = read_env_api_key() if use_real and not mock_mode else None
-                        if use_real and not mock_mode and not api_key:
-                            st.error("GEMINI_API_KEY not found. Set the environment variable or enable Mock mode.")
+                        api_key = read_env_api_key()
+                        if not api_key:
+                            st.error("GEMINI_API_KEY not found. Set it in Streamlit Secrets or environment.")
                         else:
-                            result_bytes = call_gemini_overlay(
-                                photo_bytes=photo_bytes,
-                                clothing_bytes=clothing_bytes,
-                                prompt_text=prompt_text,
-                                mock=(mock_mode or not api_key),
-                                api_key=api_key,
-                            )
-                            st.session_state["last_result"] = result_bytes
-                            st.session_state["last_photo"] = photo_bytes
-                            st.session_state["last_clothing"] = clothing_bytes
+                            try:
+                                result_bytes = call_gemini_overlay(
+                                    photo_bytes=photo_bytes,
+                                    clothing_bytes=clothing_bytes,
+                                    prompt_text=prompt_text,
+                                    mock=False,
+                                    api_key=api_key,
+                                )
+                                st.session_state["last_result"] = result_bytes
+                                st.session_state["last_photo"] = photo_bytes
+                                st.session_state["last_clothing"] = clothing_bytes
+                            except Exception as ex:
+                                st.error(f"Gemini call failed: {ex}")
                 except Exception as e:
                     st.error(f"Overlay failed: {e}")
 
@@ -732,73 +678,9 @@ def view_upload_and_apply(use_real: bool, mock_mode: bool, prompt_text: str):
             st.info("Upload images and click Apply to see results.")
 
 
-def view_preset_examples(use_real: bool, mock_mode: bool, prompt_text: str):
-    left, right = st.columns([1, 1.2])
-    assets = get_demo_assets()
-
-    with left:
-        st.subheader("Option B — Preset Examples")
-        photo_name = st.selectbox("Choose a demo photo", list(assets["photos"].keys()), index=0)
-        clothing_name = st.selectbox("Choose a demo clothing", list(assets["clothes"].keys()), index=0)
-        apply_demo = st.button("Apply to Demo", type="primary")
-
-        if apply_demo:
-            try:
-                with st.spinner("Applying overlay to demo..."):
-                    photo_bytes = assets["photos"][photo_name]
-                    clothing_bytes = assets["clothes"][clothing_name]
-
-                    # Ensure sizes reasonable
-                    photo_img = resize_image_max(bytes_to_image_safe(photo_bytes), MAX_EDGE)
-                    clothing_img = resize_image_max(bytes_to_image_safe(clothing_bytes), MAX_EDGE)
-                    photo_bytes = image_to_bytes_png(photo_img)
-                    clothing_bytes = image_to_bytes_png(clothing_img)
-
-                    api_key = read_env_api_key() if use_real and not mock_mode else None
-                    if use_real and not mock_mode and not api_key:
-                        st.error("GEMINI_API_KEY not found. Set the environment variable or enable Mock mode.")
-                    else:
-                        result_bytes = call_gemini_overlay(
-                            photo_bytes=photo_bytes,
-                            clothing_bytes=clothing_bytes,
-                            prompt_text=prompt_text,
-                            mock=(mock_mode or not api_key),
-                            api_key=api_key,
-                        )
-                        st.session_state["last_result"] = result_bytes
-                        st.session_state["last_photo"] = photo_bytes
-                        st.session_state["last_clothing"] = clothing_bytes
-            except Exception as e:
-                st.error(f"Overlay failed: {e}")
-
-    with right:
-        st.subheader("Preview")
-        p_bytes = st.session_state.get("last_photo")
-        c_bytes = st.session_state.get("last_clothing")
-        r_bytes = st.session_state.get("last_result")
-
-        if any([p_bytes, c_bytes, r_bytes]):
-            c1, c2, c3 = st.columns(3)
-            if p_bytes:
-                with c1:
-                    st.caption("Original Photo")
-                    st.image(p_bytes, caption="Demo Photo", use_container_width=True)
-            if c_bytes:
-                with c2:
-                    st.caption("Clothing Image")
-                    st.image(c_bytes, caption="Garment", use_container_width=True)
-            if r_bytes:
-                with c3:
-                    st.caption("Result")
-                    st.image(r_bytes, caption="Overlay Result", use_container_width=True)
-                    st.download_button(
-                        "Download Result",
-                        data=r_bytes,
-                        file_name="overlay_result.png",
-                        mime="image/png",
-                    )
-        else:
-            st.info("Pick a photo and clothing, then click Apply to Demo.")
+def view_preset_examples(*args, **kwargs):
+    # Deprecated: Preset examples removed for simplified UX
+    pass
 
 # =============================================================================
 # App Entry
@@ -806,13 +688,6 @@ def view_preset_examples(use_real: bool, mock_mode: bool, prompt_text: str):
 
 def main():
     show_header_and_privacy()
-
-    # Top-level mode selection
-    mode = st.radio(
-        "Choose mode",
-        ["Upload & Apply", "Preset Examples"],
-        horizontal=True,
-    )
 
     # Sidebar settings & prompt
     use_real, mock_mode, prompt_text = sidebar_controls()
@@ -822,11 +697,9 @@ def main():
     st.session_state.setdefault("last_clothing", None)
     st.session_state.setdefault("last_result", None)
 
-    if mode == "Upload & Apply":
-        view_upload_and_apply(use_real, mock_mode, prompt_text)
-    else:
-        view_preset_examples(use_real, mock_mode, prompt_text)
+    view_upload_and_apply(use_real, mock_mode, prompt_text)
 
 
 if __name__ == "__main__":
     main()
+
