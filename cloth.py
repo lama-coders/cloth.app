@@ -270,31 +270,109 @@ def simple_perspective_warp(img: Image.Image, strength: float = 0.08) -> Image.I
     return img.transform((w, h), Image.QUAD, data=sum(dst, ()), resample=Image.BICUBIC)
 
 
-def mock_overlay(photo_rgba: Image.Image, clothing_rgba: Image.Image) -> Image.Image:
+def _estimate_bg_color(img: Image.Image) -> Tuple[int, int, int]:
+    """Estimate background color from image corners (assumes near-uniform BG)."""
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    samples = []
+    k = max(1, min(w, h) // 20)
+    corners = [
+        (0, 0), (w - k, 0), (0, h - k), (w - k, h - k)
+    ]
+    for (cx, cy) in corners:
+        region = rgb.crop((cx, cy, min(cx + k, w), min(cy + k, h)))
+        colors = list(region.getdata())
+        if colors:
+            r = sum(c[0] for c in colors) // len(colors)
+            g = sum(c[1] for c in colors) // len(colors)
+            b = sum(c[2] for c in colors) // len(colors)
+            samples.append((r, g, b))
+    if not samples:
+        return (255, 255, 255)
+    r = sum(s[0] for s in samples) // len(samples)
+    g = sum(s[1] for s in samples) // len(samples)
+    b = sum(s[2] for s in samples) // len(samples)
+    return (r, g, b)
+
+
+def _remove_background_auto(img: Image.Image, threshold: int = 35) -> Image.Image:
+    """Remove a near-uniform background by chroma distance from corner-estimated color.
+
+    Returns an RGBA image with alpha where foreground kept. Also crops to tight bbox.
+    """
+    img = ensure_rgba(img)
+    # If already has transparency, keep as-is but still try to auto-trim.
+    bg = _estimate_bg_color(img)
+    rgb = img.convert("RGB")
+    w, h = rgb.size
+    # Build alpha mask based on distance from bg color
+    mask = Image.new("L", (w, h), 0)
+    pix_rgb = rgb.load()
+    pix_m = mask.load()
+    thr2 = threshold * threshold
+    for y in range(h):
+        for x in range(w):
+            pr, pg, pb = pix_rgb[x, y]
+            dr = pr - bg[0]
+            dg = pg - bg[1]
+            db = pb - bg[2]
+            dist2 = dr * dr + dg * dg + db * db
+            if dist2 > thr2:
+                pix_m[x, y] = 255
+            else:
+                pix_m[x, y] = 0
+    # Smooth and expand a bit to avoid halos
+    mask = mask.filter(ImageFilter.MaxFilter(3))
+    mask = mask.filter(ImageFilter.MedianFilter(3))
+    mask = mask.filter(ImageFilter.GaussianBlur(1.2))
+
+    out = img.copy()
+    out.putalpha(mask)
+    # Crop to content
+    bbox = mask.getbbox()
+    if bbox:
+        out = out.crop(bbox)
+    return out
+
+
+def mock_overlay(
+    photo_rgba: Image.Image,
+    clothing_rgba: Image.Image,
+    *,
+    remove_bg: bool = True,
+    width_pct: int = 60,
+    y_pct: int = 32,
+    rotation_deg: float = -3.0,
+    perspective: float = 0.08,
+) -> Image.Image:
     """Produce a plausible local overlay using Pillow only.
 
     Steps:
     - Convert to RGBA
-    - Resize clothing to ~60% width of photo
-    - Mild perspective warp + slight rotation
-    - Paste clothing centered around upper torso area
+    - Optionally remove background from clothing (auto)
+    - Resize clothing to width_pct% width of photo
+    - Mild perspective warp + rotation
+    - Paste clothing centered around upper torso region (y_pct)
     """
     base = ensure_rgba(photo_rgba)
     cloth = ensure_rgba(clothing_rgba)
 
+    if remove_bg:
+        cloth = _remove_background_auto(cloth)
+
     pw, ph = base.size
-    target_w = int(pw * 0.6)
+    target_w = int(pw * (width_pct / 100.0))
     scale = target_w / float(cloth.width)
     target_h = max(1, int(cloth.height * scale))
     cloth = cloth.resize((target_w, target_h), resample=Image.LANCZOS)
 
     # Mild warp and rotation
-    cloth = simple_perspective_warp(cloth, strength=0.08)
-    cloth = cloth.rotate(angle=-3, resample=Image.BICUBIC, expand=True)
+    cloth = simple_perspective_warp(cloth, strength=float(perspective))
+    cloth = cloth.rotate(angle=float(rotation_deg), resample=Image.BICUBIC, expand=True)
 
     # Place around upper-torso region
     x = pw // 2 - cloth.width // 2
-    y = int(ph * 0.32)
+    y = int(ph * (y_pct / 100.0))
 
     out = base.copy()
     out.alpha_composite(cloth, dest=(x, y))
@@ -331,7 +409,17 @@ def call_gemini_overlay(
         clothing_img = bytes_to_image_safe(clothing_bytes)
         photo_img = resize_image_max(photo_img, MAX_EDGE)
         clothing_img = resize_image_max(clothing_img, MAX_EDGE)
-        result = mock_overlay(photo_img, clothing_img)
+        # Read overlay options from session if available
+        opts = st.session_state.get("overlay_options", {}) if hasattr(st, "session_state") else {}
+        result = mock_overlay(
+            photo_img,
+            clothing_img,
+            remove_bg=bool(opts.get("remove_bg", True)),
+            width_pct=int(opts.get("width_pct", 60)),
+            y_pct=int(opts.get("y_pct", 32)),
+            rotation_deg=float(opts.get("rotation_deg", -3.0)),
+            perspective=float(opts.get("perspective", 0.08)),
+        )
         return image_to_bytes_png(result)
 
     # TODO: IMPLEMENT ACTUAL GEMINI CALL
@@ -358,7 +446,16 @@ def call_gemini_overlay(
     # For now, fall back to mock if we ever reach here.
     photo_img = bytes_to_image_safe(photo_bytes)
     clothing_img = bytes_to_image_safe(clothing_bytes)
-    result = mock_overlay(photo_img, clothing_img)
+    opts = st.session_state.get("overlay_options", {}) if hasattr(st, "session_state") else {}
+    result = mock_overlay(
+        photo_img,
+        clothing_img,
+        remove_bg=bool(opts.get("remove_bg", True)),
+        width_pct=int(opts.get("width_pct", 60)),
+        y_pct=int(opts.get("y_pct", 32)),
+        rotation_deg=float(opts.get("rotation_deg", -3.0)),
+        perspective=float(opts.get("perspective", 0.08)),
+    )
     return image_to_bytes_png(result)
 
 # =============================================================================
@@ -444,6 +541,22 @@ def sidebar_controls() -> Tuple[bool, bool, str]:
         )
 
     st.sidebar.caption(f"API key source: {api_key_source()}")
+
+    with st.sidebar.expander("Try-on controls (mock)", expanded=False):
+        remove_bg = st.checkbox("Auto remove garment background", value=True,
+                                help="Tries to remove a near-uniform background from the clothing image. Works best if background is solid.")
+        width_pct = st.slider("Garment width (% of photo width)", min_value=30, max_value=95, value=60, step=1)
+        y_pct = st.slider("Vertical position (upper torso %)", min_value=20, max_value=55, value=32, step=1)
+        rotation_deg = st.slider("Rotation (degrees)", min_value=-15.0, max_value=15.0, value=-3.0, step=0.5)
+        perspective = st.slider("Perspective strength", min_value=0.0, max_value=0.3, value=0.08, step=0.01)
+
+        st.session_state["overlay_options"] = {
+            "remove_bg": remove_bg,
+            "width_pct": width_pct,
+            "y_pct": y_pct,
+            "rotation_deg": rotation_deg,
+            "perspective": perspective,
+        }
 
     with st.sidebar.expander("README / How to run", expanded=False):
         st.markdown(
