@@ -422,26 +422,75 @@ def call_gemini_overlay(
         )
         return image_to_bytes_png(result)
 
-    # TODO: IMPLEMENT ACTUAL GEMINI CALL
-    # TODO: replace mock with real Gemini call
-    # Example pseudocode for future integration (do not include secrets):
-    #
-    # from google import genai
-    # client = genai.Client(api_key=api_key)
-    # response = client.models.generate_content(
-    #     model="gemini-2.5-flash-image",  # or appropriate image model
-    #     contents=[
-    #         prompt_text,
-    #         {"mime_type": "image/png", "data": base64.b64encode(photo_bytes).decode()},
-    #         {"mime_type": "image/png", "data": base64.b64encode(clothing_bytes).decode()},
-    #     ],
-    #     output_mime_type="image/png",
-    # )
-    # result_png_b64 = response.output[0].b64_data
-    # return base64.b64decode(result_png_b64)
-    #
-    # Note: Adjust to the actual Gemini SDK once finalized. Ensure the request uses
-    # the prompt, both image inputs, and returns an image/png output.
+    # Real call path using Gemini Generative Language API over HTTP
+    try:
+        model_name = st.session_state.get("model_name", "gemini-2.5-flash-image")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+        headers = {"Content-Type": "application/json"}
+        params = {"key": api_key}
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt_text},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": base64.b64encode(photo_bytes).decode("utf-8"),
+                            }
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": base64.b64encode(clothing_bytes).decode("utf-8"),
+                            }
+                        },
+                    ],
+                }
+            ],
+            # Ask for image/png output; supported on image-capable models
+            "generationConfig": {"response_mime_type": "image/png"},
+        }
+
+        resp = requests.post(url, headers=headers, params=params, json=payload, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text[:512]}")
+        data = resp.json()
+        # Expect inline data in first candidate
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError("No candidates returned from Gemini.")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            raise RuntimeError("No parts in Gemini response.")
+        # Find first inline_data
+        for p in parts:
+            if "inline_data" in p:
+                b64png = p["inline_data"].get("data")
+                if b64png:
+                    return base64.b64decode(b64png)
+        # Some models might return a data_uri field
+        for p in parts:
+            if "data" in p and isinstance(p["data"], str):
+                return base64.b64decode(p["data"])  # best effort
+        raise RuntimeError("Gemini response did not include image data.")
+    except Exception as ex:
+        # Fallback to mock on any error so the app stays usable
+        st.error(f"Gemini call failed; falling back to mock. Details: {ex}")
+        photo_img = bytes_to_image_safe(photo_bytes)
+        clothing_img = bytes_to_image_safe(clothing_bytes)
+        opts = st.session_state.get("overlay_options", {}) if hasattr(st, "session_state") else {}
+        result = mock_overlay(
+            photo_img,
+            clothing_img,
+            remove_bg=bool(opts.get("remove_bg", True)),
+            width_pct=int(opts.get("width_pct", 60)),
+            y_pct=int(opts.get("y_pct", 32)),
+            rotation_deg=float(opts.get("rotation_deg", -3.0)),
+            perspective=float(opts.get("perspective", 0.08)),
+        )
+        return image_to_bytes_png(result)
 
     # For now, fall back to mock if we ever reach here.
     photo_img = bytes_to_image_safe(photo_bytes)
@@ -542,6 +591,18 @@ def sidebar_controls() -> Tuple[bool, bool, str]:
 
     st.sidebar.caption(f"API key source: {api_key_source()}")
 
+    # Model selector (used when real Gemini is enabled)
+    model = st.sidebar.selectbox(
+        "Gemini model",
+        options=[
+            "gemini-2.5-flash-image",
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-flash",
+        ],
+        index=0,
+        help="Model used for real calls. Must support image IO.",
+    )
+
     with st.sidebar.expander("Try-on controls (mock)", expanded=False):
         remove_bg = st.checkbox("Auto remove garment background", value=True,
                                 help="Tries to remove a near-uniform background from the clothing image. Works best if background is solid.")
@@ -557,6 +618,8 @@ def sidebar_controls() -> Tuple[bool, bool, str]:
             "rotation_deg": rotation_deg,
             "perspective": perspective,
         }
+
+    st.session_state["model_name"] = model
 
     with st.sidebar.expander("README / How to run", expanded=False):
         st.markdown(
